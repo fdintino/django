@@ -33,6 +33,7 @@ from django.utils.datastructures import SortedDict
 from django.utils.html import escape, escapejs
 from django.utils.safestring import mark_safe
 from django.utils import six
+from django.utils.six.moves import zip as izip
 from django.utils.deprecation import RenameMethodsBase
 from django.utils.http import urlencode
 from django.utils.text import capfirst, get_text_list
@@ -366,6 +367,194 @@ class BaseModelAdmin(six.with_metaclass(RenameBaseModelAdminMethods)):
         codename = get_permission_codename('delete', opts)
         return request.user.has_perm("%s.%s" % (opts.app_label, codename))
 
+    def _get_formset_instances(self, request, instance, is_new=False, **kwargs):
+        prefixes = {}
+        obj = None
+        if not is_new:
+            obj = instance
+
+        formset_kwargs = {}
+        if request.method == 'POST':
+            formset_kwargs.update({
+                'data': request.POST,
+                'files': request.FILES,
+            })
+            if is_new:
+                formset_kwargs.update({
+                    'save_as_new': request.POST.has_key('_saveasnew')
+                })
+
+        for FormSet, inline in zip(self.get_formsets(request, obj, **kwargs), self.get_inline_instances(request, obj)):
+            prefix = FormSet.get_default_prefix()
+            prefixes[prefix] = prefixes.get(prefix, 0) + 1
+            if prefixes[prefix] != 1:
+                prefix = "%s-%s" % (prefix, prefixes[prefix])
+
+            if hasattr(inline, 'get_queryset'):
+                # Django 1.6
+                queryset = inline.get_queryset(request)
+            else:
+                queryset = inline.queryset(request)
+
+            formset = FormSet(instance=instance, prefix=prefix,
+                              queryset=queryset,
+                              **formset_kwargs)
+            yield formset
+
+    def get_formset_instances(self, request, instance, is_new=False, **kwargs):
+        obj = None
+        if not is_new:
+            obj = instance
+
+        formset_kwargs = {}
+        if request.method == 'POST':
+            formset_kwargs.update({
+                'data': request.POST,
+                'files': request.FILES, })
+
+            if is_new:
+                formset_kwargs.update({
+                    'save_as_new': request.POST.has_key('_saveasnew')})
+
+        formset_iterator = self._get_formset_instances(
+            request, instance, is_new, **kwargs)
+        inline_iterator = self.get_inline_instances(request, obj)
+
+        try:
+            while True:
+                formset = formset_iterator.next()
+                if not hasattr(formset, 'nesting_depth'):
+                    formset.nesting_depth = 1
+                inline = inline_iterator.next()
+                yield formset
+                if getattr(inline, 'inlines', []) and request.method == 'POST':
+                    inlines_and_formsets = [
+                        (nested, formset)
+                        for nested in inline.get_inline_instances(request)]
+                    i = 0
+                    while i < len(inlines_and_formsets):
+                        nested, formset = inlines_and_formsets[i]
+                        i += 1
+                        for form in formset.forms:
+                            formset_kwargs = formset_kwargs or {}
+                            InlineFormSet = nested.get_formset(request, form.instance, **kwargs)
+                            prefix = '%s-%s' % (form.prefix, InlineFormSet.get_default_prefix())
+                            nested_formset = InlineFormSet(instance=form.instance, prefix=prefix,
+                                **formset_kwargs)
+                            # We set `is_nested` to True so that we have a way
+                            # to identify this formset as such and skip it if
+                            # there is an error in the POST and we have to create
+                            # inline admin formsets.
+                            nested_formset.is_nested = True
+                            nested_formset.nesting_depth = formset.nesting_depth + 1
+                            yield nested_formset
+
+                            if hasattr(nested, 'get_inline_instances'):
+                                inlines_and_formsets += [
+                                    (nested_nested, nested_formset)
+                                    for nested_nested in nested.get_inline_instances(request)]
+        except StopIteration:
+            raise
+
+    def get_nested_inlines(self, request, prefix, inline, parent_formset=None, obj=None):
+        nested_inline_formsets = []
+        if not hasattr(inline, 'get_inline_instances'):
+            return nested_inline_formsets
+        for nested in inline.get_inline_instances(request):
+            InlineFormSet = nested.get_formset(request, obj)
+            nested_prefix = '%s-%s' % (prefix, InlineFormSet.get_default_prefix())
+            nested_formset_kwargs = {
+                'instance': obj,
+                'prefix': nested_prefix,
+            }
+            if request.method == 'POST' and not prefix.endswith('-empty'):
+                nested_formset_kwargs.update({
+                    'data': request.POST,
+                    'files': request.FILES,
+                })
+            nested_formset = InlineFormSet(**nested_formset_kwargs)
+            nested_formset.is_nested = True
+            if parent_formset is not None:
+                nested_formset.nesting_depth = 1 + getattr(parent_formset.formset, 'nesting_depth', 1)
+            nested_inline = self.get_nested_inline_admin_formset(request, nested,
+                nested_formset, obj)
+            nested_inline_formsets.append(nested_inline)
+            nested_inline_formsets += self.get_nested_inlines(request, nested_prefix, nested, nested_inline, obj)
+        return nested_inline_formsets
+
+    def get_nested_inline_admin_formset(self, request, inline, formset, obj=None):
+        return helpers.InlineAdminFormSet(inline, formset,
+            inline.get_fieldsets(request, obj))
+
+    def _get_inline_admin_formsets(self, request, formsets, obj=None):
+        for inline, formset in izip(self.get_inline_instances(request, obj), formsets):
+            fieldsets = list(inline.get_fieldsets(request, obj))
+            readonly = list(inline.get_readonly_fields(request, obj))
+            inline_admin_formset = helpers.InlineAdminFormSet(inline, formset,
+                fieldsets, readonly_fields=readonly, model_admin=self)
+            yield inline_admin_formset
+
+    def get_inline_admin_formsets(self, request, formsets, obj=None):
+        inline_iterator = self.get_inline_instances(request, obj)
+        # The only reason a nested inline admin formset would show up
+        # here is if there was an error in the POST.
+        # inline_admin_formsets are for display, not data submission,
+        # and the way the nested forms are displayed is by setting the
+        # 'inlines' attribute on inline_admin_formset.formset.forms items.
+        # So we iterate through to find any `is_nested` formsets and save
+        # them in dict `orig_nested_formsets`, keyed on the formset prefix,
+        # as we'll need to swap out the nested formsets in the
+        # InlineAdminFormSet.inlines if we want error messages to appear.
+        orig_nested_formsets = {}
+        non_nested_formsets = []
+        for formset in formsets:
+            if getattr(formset, 'is_nested', False):
+                orig_nested_formsets[formset.prefix] = formset
+            else:
+                non_nested_formsets.append(formset)
+        super_iterator = self._get_inline_admin_formsets(request,
+            non_nested_formsets, obj)
+        formset_iterator = iter(non_nested_formsets)
+        try:
+            while True:
+                formset = formset_iterator.next()
+                inline = inline_iterator.next()
+                inline_admin_formset = super_iterator.next()
+
+                for form in inline_admin_formset.formset.forms:
+                    if form.instance.pk:
+                        instance = form.instance
+                    else:
+                        instance = None
+                    form_inlines = self.get_nested_inlines(request, form.prefix, inline,
+                        parent_formset=inline_admin_formset, obj=instance)
+                    # Check whether nested inline formsets were already submitted.
+                    # If so, use the submitted formset instead of the freshly generated
+                    # one since it will contain error information and non-saved data
+                    # changes.
+                    if hasattr(inline, 'get_inline_instances'):
+                        nested_inline_cls_iterator = inline.get_inline_instances(request)
+                        for i, form_inline in enumerate(form_inlines):
+                            try:
+                                nested_inline_cls = nested_inline_cls_iterator.next()
+                            except StopIteration:
+                                break
+                            if form_inline.formset.prefix in orig_nested_formsets:
+                                orig_nested_formset = orig_nested_formsets[form_inline.formset.prefix]
+                                form_inlines[i] = self.get_nested_inline_admin_formset(request,
+                                    inline=nested_inline_cls,
+                                    formset=orig_nested_formset,
+                                    obj=form_inline.formset.instance)
+                    form.inlines = form_inlines
+                # The empty prefix is used by django javascript when it tries
+                # to determine the ids to give to the fields of newly created
+                # instances in the form.
+                empty_prefix = formset.add_prefix('empty')
+                inline_admin_formset.inlines = self.get_nested_inlines(
+                    request, empty_prefix, inline, parent_formset=inline_admin_formset)
+                yield inline_admin_formset
+        except StopIteration:
+            raise
 
 class ModelAdmin(BaseModelAdmin):
     "Encapsulates all admin options and functionality for a given model."
@@ -407,10 +596,13 @@ class ModelAdmin(BaseModelAdmin):
         self.model = model
         self.opts = model._meta
         self.admin_site = admin_site
+        self.inline_instances = []
+        for inline_class in self.inlines:
+            inline_instance = inline_class(self.model, self.admin_site)
+            self.inline_instances.append(inline_instance)
         super(ModelAdmin, self).__init__()
 
     def get_inline_instances(self, request, obj=None):
-        inline_instances = []
         for inline_class in self.inlines:
             inline = inline_class(self.model, self.admin_site)
             if request:
@@ -420,9 +612,7 @@ class ModelAdmin(BaseModelAdmin):
                     continue
                 if not inline.has_add_permission(request):
                     inline.max_num = 0
-            inline_instances.append(inline)
-
-        return inline_instances
+            yield inline
 
     def get_urls(self):
         from django.conf.urls import patterns, url
@@ -578,9 +768,9 @@ class ModelAdmin(BaseModelAdmin):
             self.get_changelist_form(request), extra=0,
             fields=self.list_editable, **defaults)
 
-    def get_formsets(self, request, obj=None):
+    def get_formsets(self, request, obj=None, **kwargs):
         for inline in self.get_inline_instances(request, obj):
-            yield inline.get_formset(request, obj)
+            yield inline.get_formset(request, obj, **kwargs)
 
     def get_paginator(self, request, queryset, per_page, orphans=0, allow_empty_first_page=True):
         return self.paginator(queryset, per_page, orphans, allow_empty_first_page)
@@ -1095,44 +1285,23 @@ class ModelAdmin(BaseModelAdmin):
             self.message_user(request, msg, messages.WARNING)
             return None
 
-    @csrf_protect_m
-    @transaction.atomic
-    def add_view(self, request, form_url='', extra_context=None):
-        "The 'add' admin view for this model."
-        model = self.model
-        opts = model._meta
-
-        if not self.has_add_permission(request):
-            raise PermissionDenied
-
-        ModelForm = self.get_form(request)
-        formsets = []
-        inline_instances = self.get_inline_instances(request, None)
-        if request.method == 'POST':
-            form = ModelForm(request.POST, request.FILES)
-            if form.is_valid():
-                new_object = self.save_form(request, form, change=False)
-                form_validated = True
-            else:
-                form_validated = False
-                new_object = self.model()
-            prefixes = {}
-            for FormSet, inline in zip(self.get_formsets(request), inline_instances):
-                prefix = FormSet.get_default_prefix()
-                prefixes[prefix] = prefixes.get(prefix, 0) + 1
-                if prefixes[prefix] != 1 or not prefix:
-                    prefix = "%s-%s" % (prefix, prefixes[prefix])
-                formset = FormSet(data=request.POST, files=request.FILES,
-                                  instance=new_object,
-                                  save_as_new="_saveasnew" in request.POST,
-                                  prefix=prefix, queryset=inline.get_queryset(request))
-                formsets.append(formset)
-            if all_valid(formsets) and form_validated:
-                self.save_model(request, new_object, form, False)
-                self.save_related(request, form, formsets, False)
-                self.log_addition(request, new_object)
-                return self.response_add(request, new_object)
+    def get_main_view_form(self, request, instance=None, form_cls=None):
+        if form_cls is not None:
+            ModelForm = form_cls
+        elif instance is not None:
+            ModelForm = self.get_form(request, instance)
         else:
+            ModelForm = self.get_form(request)
+
+        if request.method == 'POST':
+            form_kwargs = {}
+            if instance is not None:
+                form_kwargs['instance'] = instance
+            return ModelForm(request.POST, request.FILES, **form_kwargs)
+        elif instance is not None:
+            return ModelForm(instance=instance)
+        else:
+            opts = self.model._meta
             # Prepare the dict of initial data from the request.
             # We have to special-case M2Ms as a list of comma-separated PKs.
             initial = dict(request.GET.items())
@@ -1143,32 +1312,71 @@ class ModelAdmin(BaseModelAdmin):
                     continue
                 if isinstance(f, models.ManyToManyField):
                     initial[k] = initial[k].split(",")
-            form = ModelForm(initial=initial)
-            prefixes = {}
-            for FormSet, inline in zip(self.get_formsets(request), inline_instances):
-                prefix = FormSet.get_default_prefix()
-                prefixes[prefix] = prefixes.get(prefix, 0) + 1
-                if prefixes[prefix] != 1 or not prefix:
-                    prefix = "%s-%s" % (prefix, prefixes[prefix])
-                formset = FormSet(instance=self.model(), prefix=prefix,
-                                  queryset=inline.get_queryset(request))
-                formsets.append(formset)
+            return ModelForm(initial=initial)
 
-        adminForm = helpers.AdminForm(form, list(self.get_fieldsets(request)),
-            self.get_prepopulated_fields(request),
-            self.get_readonly_fields(request),
+    def save_view_formsets(self, request, instance, form, formsets, is_new=False):
+        change = not is_new
+        self.save_model(request, instance, form, change=change)
+        if hasattr(self, 'save_related'):
+            # Django 1.6
+            self.save_related(request, form, formsets, change=change)
+        else:
+            # Django <= 1.5
+            form.save_m2m()
+            for formset in formsets:
+                self.save_formset(request, form, formset, change=change)
+        if is_new:
+            self.log_addition(request, instance)
+        else:
+            change_message = self.construct_change_message(request, form, formsets)
+            self.log_change(request, instance, change_message)
+
+    @csrf_protect_m
+    @transaction.atomic
+    def add_view(self, request, form_url='', extra_context=None):
+        "The 'add' admin view for this model."
+        model = self.model
+        opts = model._meta
+
+        if not self.has_add_permission(request):
+            raise PermissionDenied
+
+        formsets = []
+        form = self.get_main_view_form(request)
+        if request.method == 'POST':
+            if form.is_valid():
+                new_object = self.save_form(request, form, change=False)
+                form_validated = True
+            else:
+                form_validated = False
+                new_object = self.model()
+        else:
+            new_object = self.model()
+
+        for formset in self.get_formset_instances(request, new_object, is_new=True):
+            formsets.append(formset)
+
+        if request.method == 'POST' and all_valid(formsets) and form_validated:
+            self.save_view_formsets(request, new_object, form, formsets, is_new=True)
+            return self.response_add(request, new_object)
+
+        if hasattr(self, 'get_prepopulated_fields'):
+            # Django 1.4
+            prepopulated_fields = self.get_prepopulated_fields(request)
+        else:
+            prepopulated_fields = self.prepopulated_fields
+
+        adminForm = helpers.AdminForm(form, self.get_fieldsets(request),
+            prepopulated_fields, self.get_readonly_fields(request),
             model_admin=self)
         media = self.media + adminForm.media
 
         inline_admin_formsets = []
-        for inline, formset in zip(inline_instances, formsets):
-            fieldsets = list(inline.get_fieldsets(request))
-            readonly = list(inline.get_readonly_fields(request))
-            prepopulated = dict(inline.get_prepopulated_fields(request))
-            inline_admin_formset = helpers.InlineAdminFormSet(inline, formset,
-                fieldsets, prepopulated, readonly, model_admin=self)
+        for inline_admin_formset in self.get_inline_admin_formsets(request, formsets):
             inline_admin_formsets.append(inline_admin_formset)
             media = media + inline_admin_formset.media
+            for nested in getattr(inline_admin_formset, 'inlines', []):
+                media += nested.media
 
         context = {
             'title': _('Add %s') % force_text(opts.verbose_name),
@@ -1203,63 +1411,42 @@ class ModelAdmin(BaseModelAdmin):
                                     (opts.app_label, opts.model_name),
                                     current_app=self.admin_site.name))
 
-        ModelForm = self.get_form(request, obj)
         formsets = []
-        inline_instances = self.get_inline_instances(request, obj)
+        form = self.get_main_view_form(request, obj)
         if request.method == 'POST':
-            form = ModelForm(request.POST, request.FILES, instance=obj)
             if form.is_valid():
                 form_validated = True
                 new_object = self.save_form(request, form, change=True)
             else:
                 form_validated = False
                 new_object = obj
-            prefixes = {}
-            for FormSet, inline in zip(self.get_formsets(request, new_object), inline_instances):
-                prefix = FormSet.get_default_prefix()
-                prefixes[prefix] = prefixes.get(prefix, 0) + 1
-                if prefixes[prefix] != 1 or not prefix:
-                    prefix = "%s-%s" % (prefix, prefixes[prefix])
-                formset = FormSet(request.POST, request.FILES,
-                                  instance=new_object, prefix=prefix,
-                                  queryset=inline.get_queryset(request))
-
-                formsets.append(formset)
-
-            if all_valid(formsets) and form_validated:
-                self.save_model(request, new_object, form, True)
-                self.save_related(request, form, formsets, True)
-                change_message = self.construct_change_message(request, form, formsets)
-                self.log_change(request, new_object, change_message)
-                return self.response_change(request, new_object)
-
         else:
-            form = ModelForm(instance=obj)
-            prefixes = {}
-            for FormSet, inline in zip(self.get_formsets(request, obj), inline_instances):
-                prefix = FormSet.get_default_prefix()
-                prefixes[prefix] = prefixes.get(prefix, 0) + 1
-                if prefixes[prefix] != 1 or not prefix:
-                    prefix = "%s-%s" % (prefix, prefixes[prefix])
-                formset = FormSet(instance=obj, prefix=prefix,
-                                  queryset=inline.get_queryset(request))
-                formsets.append(formset)
+            new_object = obj
+
+        for formset in self.get_formset_instances(request, new_object, is_new=False):
+            formsets.append(formset)
+
+        if request.method == 'POST' and all_valid(formsets) and form_validated:
+            self.save_view_formsets(request, new_object, form, formsets, is_new=False)
+            return self.response_change(request, new_object)
+
+        if hasattr(self, 'get_prepopulated_fields'):
+            # Django 1.4
+            prepopulated_fields = self.get_prepopulated_fields(request)
+        else:
+            prepopulated_fields = self.prepopulated_fields
 
         adminForm = helpers.AdminForm(form, self.get_fieldsets(request, obj),
-            self.get_prepopulated_fields(request, obj),
-            self.get_readonly_fields(request, obj),
+            prepopulated_fields, self.get_readonly_fields(request, obj),
             model_admin=self)
         media = self.media + adminForm.media
 
         inline_admin_formsets = []
-        for inline, formset in zip(inline_instances, formsets):
-            fieldsets = list(inline.get_fieldsets(request, obj))
-            readonly = list(inline.get_readonly_fields(request, obj))
-            prepopulated = dict(inline.get_prepopulated_fields(request, obj))
-            inline_admin_formset = helpers.InlineAdminFormSet(inline, formset,
-                fieldsets, prepopulated, readonly, model_admin=self)
+        for inline_admin_formset in self.get_inline_admin_formsets(request, formsets, obj):
             inline_admin_formsets.append(inline_admin_formset)
             media = media + inline_admin_formset.media
+            for nested in getattr(inline_admin_formset, 'inlines', []):
+                media += nested.media
 
         context = {
             'title': _('Change %s') % force_text(opts.verbose_name),
@@ -1591,6 +1778,18 @@ class InlineModelAdmin(BaseModelAdmin):
     def get_max_num(self, request, obj=None, **kwargs):
         """Hook for customizing the max number of extra inline forms."""
         return self.max_num
+
+    def get_inline_instances(self, request):
+        for inline_class in getattr(self, 'inlines', None) or []:
+            inline = inline_class(self.model, self.admin_site)
+            if request:
+                if not (inline.has_add_permission(request) or
+                        inline.has_change_permission(request) or
+                        inline.has_delete_permission(request)):
+                    continue
+                if not inline.has_add_permission(request):
+                    inline.max_num = 0
+            yield inline
 
     def get_formset(self, request, obj=None, **kwargs):
         """Returns a BaseInlineFormSet class for use in admin add/change views."""
